@@ -1,0 +1,109 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+ppt_files表结构
+
+Columns
+
+Name	Format	Type	Description
+id	
+uuid
+
+string	
+title	
+character varying
+
+string	
+file_name	
+character varying
+
+string	
+file_size	
+bigint
+
+number	
+page_count	
+integer
+
+number	
+file_type	
+character varying
+
+string	
+download_count	
+integer
+
+number	
+view_count	
+integer
+
+number	
+r2_file_key	
+character varying
+
+string	
+preview_generated	
+boolean
+
+boolean	
+created_at	
+timestamp without time zone
+
+string	
+updated_at	
+timestamp without time zone
+
+string	
+category	
+character varying
+
+string	
+subcategory	
+character varying
+
+string	
+tags	
+text[]
+
+array	
+slug	
+character varying
+
+string	
+description	
+text
+
+string	
+
+ppt_previews表结构：
+
+Columns
+
+Name	Format	Type	Description
+id	
+uuid
+
+string	
+ppt_id	
+uuid
+
+string	
+page_number	
+integer
+
+number	
+preview_url	
+character varying
+
+string	
+thumbnail_url	
+character varying
+
+string	
+created_at	
+timestamp without time zone
+
+
+string	
