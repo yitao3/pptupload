@@ -8,6 +8,15 @@ import os from 'os';
 import sharp from 'sharp';
 import mime from 'mime-types';
 
+// Configure body size limit for this route
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '100mb',
+    },
+  },
+};
+
 console.log("Module /api/process-ppt/route.ts loaded successfully.");
 
 // --- Helper Functions (copied from previous files) ---
@@ -154,186 +163,217 @@ ${getCategoryPrompt()}
 
 export async function POST(req: NextRequest) {
   console.log('[API /process-ppt] Received new request.');
-  const formData = await req.formData();
-  const file = formData.get('file') as File;
-
-  if (!file) {
-    return NextResponse.json({ error: 'No file provided' }, { status: 400 });
-  }
-
-  let tempDir: string | null = null;
-
+  
   try {
-    console.log('[API /process-ppt] Entering main try block.');
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ppt-process-'));
-    const tempFilePath = path.join(tempDir, file.name);
-    
-    const s3Client = getS3Client();
-    const supabase = getSupabaseClient();
-    const r2Bucket = process.env.R2_BUCKET_NAME;
-    if (!r2Bucket) {
-        throw new Error('R2_BUCKET_NAME environment variable not set');
+    const formData = await req.formData();
+    const file = formData.get('file') as File;
+
+    if (!file) {
+      return NextResponse.json({ error: 'No file provided' }, { status: 400 });
     }
 
-    // 1. Save file temporarily
-    await fs.writeFile(tempFilePath, Buffer.from(await file.arrayBuffer()));
-    console.log(`[API /process-ppt] Step 1: File saved to temp path: ${tempFilePath}`);
-
-    // 2. Generate Previews & Get Page Count FIRST
-    const previewOutputDir = path.join(tempDir, 'previews');
-    await fs.mkdir(previewOutputDir, { recursive: true });
-    const convertOutputJson = await runPythonScript('convert.py', [tempFilePath, previewOutputDir]);
-    const previewData = JSON.parse(convertOutputJson.trim());
-    const pageCount = previewData.page_count || 0;
-    console.log(`[API /process-ppt] Step 2: File has ${pageCount} pages.`);
-
-    // 3. Check Page Count: Skip if less than 10
-    if (pageCount < 10) {
-        console.log(`[API /process-ppt] Skipping file because it has only ${pageCount} pages. No DB record will be created.`);
-        await fs.rm(tempDir, { recursive: true, force: true });
-        return NextResponse.json({
-            skipped: true,
-            reason: `File skipped: Page count (${pageCount}) is less than 10.`,
-            fileName: file.name
-        });
+    // Check file size (100MB limit)
+    const maxSize = 100 * 1024 * 1024; // 100MB
+    if (file.size > maxSize) {
+      return NextResponse.json({ 
+        error: 'File too large', 
+        message: `File size exceeds limit. Maximum allowed: 100MB, Current file size: ${(file.size / 1024 / 1024).toFixed(2)}MB` 
+      }, { status: 413 });
     }
 
-    if (!previewData.previews || previewData.previews.length === 0) {
-        throw new Error('convert.py did not return any preview paths.');
-    }
-    
-    // 4. Extract text (only if page count is valid)
-    const extractedText = await runPythonScript('extract_text.py', [tempFilePath]);
-    console.log(`[API /process-ppt] Step 4: Extracted ${extractedText.length} characters of text.`);
-    
-    // 5. Get metadata from AI
-    const metadata = await getAiMetadata(extractedText, file.name);
-    console.log(`[API /process-ppt] Step 5: Received metadata from AI. Title: ${metadata.title}`);
+    let tempDir: string | null = null;
 
-    const uniqueSlug = `${metadata.slug}-${Date.now().toString(36).slice(-6)}`;
-    
-    // 6. Create initial DB record to get an ID
-    const { data: pptFileData, error: insertError } = await supabase
-      .from('ppt_files')
-      .insert({
-        title: metadata.title,
-        slug: uniqueSlug,
-        description: metadata.description,
-        category: metadata.category,
-        subcategory: metadata.subcategory,
-        tags: metadata.tags || [],
-        file_name: file.name,
-        file_size: file.size,
-        file_type: path.extname(file.name).slice(1),
-        page_count: pageCount, // We already have the page count
-      })
-      .select('id')
-      .single();
+    try {
+      console.log('[API /process-ppt] Entering main try block.');
+      tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ppt-process-'));
+      const tempFilePath = path.join(tempDir, file.name);
+      
+      const s3Client = getS3Client();
+      const supabase = getSupabaseClient();
+      const r2Bucket = process.env.R2_BUCKET_NAME;
+      if (!r2Bucket) {
+          throw new Error('R2_BUCKET_NAME environment variable not set');
+      }
 
-    if (insertError) throw insertError;
-    const pptId = pptFileData.id;
-    console.log(`[API /process-ppt] Step 6: Created initial DB record with ID: ${pptId}`);
-    
-    // 7. Upload original PPT to R2
-    const originalFileKey = await uploadToR2(
-      s3Client,
-      r2Bucket,
-      `ppt-files/${pptId}/original/${file.name}`,
-      await fs.readFile(tempFilePath),
-      file.type
-    );
-    console.log(`[API /process-ppt] Step 7: Uploaded original file to R2 with key: ${originalFileKey}`);
-    
-    // 8. Create and upload thumbnail
-    const firstPreviewPath = previewData.previews[0];
-    const thumbnailBuffer = await sharp(firstPreviewPath).resize(400, 225, { fit: 'inside' }).webp({ quality: 80 }).toBuffer();
-    const thumbnailKey = await uploadToR2(
+      // 1. Save file temporarily
+      await fs.writeFile(tempFilePath, Buffer.from(await file.arrayBuffer()));
+      console.log(`[API /process-ppt] Step 1: File saved to temp path: ${tempFilePath}`);
+
+      // 2. Generate Previews & Get Page Count FIRST
+      const previewOutputDir = path.join(tempDir, 'previews');
+      await fs.mkdir(previewOutputDir, { recursive: true });
+      const convertOutputJson = await runPythonScript('convert.py', [tempFilePath, previewOutputDir]);
+      const previewData = JSON.parse(convertOutputJson.trim());
+      const pageCount = previewData.page_count || 0;
+      console.log(`[API /process-ppt] Step 2: File has ${pageCount} pages.`);
+
+      // 3. Check Page Count: Skip if less than 10
+      if (pageCount < 10) {
+          console.log(`[API /process-ppt] Skipping file because it has only ${pageCount} pages. No DB record will be created.`);
+          await fs.rm(tempDir, { recursive: true, force: true });
+          return NextResponse.json({
+              skipped: true,
+              reason: `File skipped: Page count (${pageCount}) is less than 10.`,
+              fileName: file.name
+          });
+      }
+
+      if (!previewData.previews || previewData.previews.length === 0) {
+          throw new Error('convert.py did not return any preview paths.');
+      }
+      
+      // 4. Extract text (only if page count is valid)
+      const extractedText = await runPythonScript('extract_text.py', [tempFilePath]);
+      console.log(`[API /process-ppt] Step 4: Extracted ${extractedText.length} characters of text.`);
+      
+      // 5. Get metadata from AI
+      const metadata = await getAiMetadata(extractedText, file.name);
+      console.log(`[API /process-ppt] Step 5: Received metadata from AI. Title: ${metadata.title}`);
+
+      const uniqueSlug = `${metadata.slug}-${Date.now().toString(36).slice(-6)}`;
+      
+      // 6. Create initial DB record to get an ID
+      const { data: pptFileData, error: insertError } = await supabase
+        .from('ppt_files')
+        .insert({
+          title: metadata.title,
+          slug: uniqueSlug,
+          description: metadata.description,
+          category: metadata.category,
+          subcategory: metadata.subcategory,
+          tags: metadata.tags || [],
+          file_name: file.name,
+          file_size: file.size,
+          file_type: path.extname(file.name).slice(1),
+          page_count: pageCount, // We already have the page count
+        })
+        .select('id')
+        .single();
+
+      if (insertError) throw insertError;
+      const pptId = pptFileData.id;
+      console.log(`[API /process-ppt] Step 6: Created initial DB record with ID: ${pptId}`);
+      
+      // 7. Upload original PPT to R2
+      const originalFileKey = await uploadToR2(
         s3Client,
         r2Bucket,
-        `ppt-files/${pptId}/previews/thumbnail.webp`,
-        thumbnailBuffer,
-        'image/webp'
-    );
-    console.log(`[API /process-ppt] Step 8: Created and uploaded thumbnail to R2 with key: ${thumbnailKey}`);
+        `ppt-files/${pptId}/original/${file.name}`,
+        await fs.readFile(tempFilePath),
+        file.type
+      );
+      console.log(`[API /process-ppt] Step 7: Uploaded original file to R2 with key: ${originalFileKey}`);
+      
+      // 8. Create and upload thumbnail
+      const firstPreviewPath = previewData.previews[0];
+      const thumbnailBuffer = await sharp(firstPreviewPath).resize(400, 225, { fit: 'inside' }).webp({ quality: 80 }).toBuffer();
+      const thumbnailKey = await uploadToR2(
+          s3Client,
+          r2Bucket,
+          `ppt-files/${pptId}/previews/thumbnail.webp`,
+          thumbnailBuffer,
+          'image/webp'
+      );
+      console.log(`[API /process-ppt] Step 8: Created and uploaded thumbnail to R2 with key: ${thumbnailKey}`);
 
-    // 9. Upload all preview & thumbnail images and record them to DB
-    console.log(`[API /process-ppt] Step 9: Starting upload of all page previews and thumbnails.`);
-    const previewRecords: { ppt_id: string; page_number: number; preview_url: string; thumbnail_url: string; }[] = [];
+      // 9. Upload all preview & thumbnail images and record them to DB
+      console.log(`[API /process-ppt] Step 9: Starting upload of all page previews and thumbnails.`);
+      const previewRecords: { ppt_id: string; page_number: number; preview_url: string; thumbnail_url: string; }[] = [];
 
-    for (let i = 0; i < previewData.previews.length; i++) {
-        const pageNum = i + 1;
-        
-        // Process and upload Preview
-        const previewPath = previewData.previews[i];
-        const previewBuffer = await fs.readFile(previewPath);
-        const previewWebpBuffer = await sharp(previewBuffer).webp({ quality: 90 }).toBuffer();
-        const previewKey = await uploadToR2(
-            s3Client,
-            r2Bucket,
-            `ppt-files/${pptId}/previews/page-${pageNum}.webp`,
-            previewWebpBuffer,
-            'image/webp'
-        );
+      for (let i = 0; i < previewData.previews.length; i++) {
+          const pageNum = i + 1;
+          
+          // Process and upload Preview
+          const previewPath = previewData.previews[i];
+          const previewBuffer = await fs.readFile(previewPath);
+          const previewWebpBuffer = await sharp(previewBuffer).webp({ quality: 90 }).toBuffer();
+          const previewKey = await uploadToR2(
+              s3Client,
+              r2Bucket,
+              `ppt-files/${pptId}/previews/page-${pageNum}.webp`,
+              previewWebpBuffer,
+              'image/webp'
+          );
 
-        // Process and upload Thumbnail
-        const thumbnailPath = previewData.thumbnails[i];
-        const thumbnailBuffer = await fs.readFile(thumbnailPath);
-        const thumbnailWebpBuffer = await sharp(thumbnailBuffer).webp({ quality: 85 }).toBuffer();
-        const pageThumbnailKey = await uploadToR2(
-            s3Client,
-            r2Bucket,
-            `ppt-files/${pptId}/previews/page-${pageNum}-thumb.webp`,
-            thumbnailWebpBuffer,
-            'image/webp'
-        );
-        
-        previewRecords.push({
-            ppt_id: pptId,
-            page_number: pageNum,
-            preview_url: previewKey,
-            thumbnail_url: pageThumbnailKey,
-        });
-        console.log(`[API /process-ppt] - Uploaded page ${pageNum} preview and thumbnail.`);
-    }
-    
-    const { error: previewInsertError } = await supabase.from('ppt_previews').insert(previewRecords);
+          // Process and upload Thumbnail
+          const thumbnailPath = previewData.thumbnails[i];
+          const thumbnailBuffer = await fs.readFile(thumbnailPath);
+          const thumbnailWebpBuffer = await sharp(thumbnailBuffer).webp({ quality: 85 }).toBuffer();
+          const pageThumbnailKey = await uploadToR2(
+              s3Client,
+              r2Bucket,
+              `ppt-files/${pptId}/previews/page-${pageNum}-thumb.webp`,
+              thumbnailWebpBuffer,
+              'image/webp'
+          );
+          
+          previewRecords.push({
+              ppt_id: pptId,
+              page_number: pageNum,
+              preview_url: previewKey,
+              thumbnail_url: pageThumbnailKey,
+          });
+          console.log(`[API /process-ppt] - Uploaded page ${pageNum} preview and thumbnail.`);
+      }
+      
+      const { error: previewInsertError } = await supabase.from('ppt_previews').insert(previewRecords);
 
-    if (previewInsertError) {
-        console.error('[API /process-ppt] Error inserting into ppt_previews:', previewInsertError);
-        throw previewInsertError;
-    }
+      if (previewInsertError) {
+          console.error('[API /process-ppt] Error inserting into ppt_previews:', previewInsertError);
+          throw previewInsertError;
+      }
 
-    console.log(`[API /process-ppt] Step 9: Finished upload and recorded ${previewRecords.length} pages to ppt_previews.`);
+      console.log(`[API /process-ppt] Step 9: Finished upload and recorded ${previewRecords.length} pages to ppt_previews.`);
 
-    // 10. Update the main DB record with R2 keys
-    await supabase
-      .from('ppt_files')
-      .update({
-        r2_file_key: originalFileKey,
+      // 10. Update the main DB record with R2 keys
+      await supabase
+        .from('ppt_files')
+        .update({
+          r2_file_key: originalFileKey,
+          r2_thumbnail_key: thumbnailKey,
+          // page_count is already set during insert
+        })
+        .eq('id', pptId);
+      console.log(`[API /process-ppt] Step 10: Finalized DB record.`);
+
+      // 11. Success
+      console.log('[API /process-ppt] Processing finished successfully.');
+      await fs.rm(tempDir, { recursive: true, force: true });
+      console.log(`[API /process-ppt] Cleanup: Removed temp directory ${tempDir}`);
+
+      // Final success response should contain all the relevant data
+      return NextResponse.json({
+        message: 'File processed and all assets stored successfully.',
+        pptId: pptId,
+        r2_original_key: originalFileKey,
         r2_thumbnail_key: thumbnailKey,
-        // page_count is already set during insert
-      })
-      .eq('id', pptId);
-    console.log(`[API /process-ppt] Step 10: Finalized DB record.`);
+        r2_preview_keys: previewRecords.map(record => record.preview_url),
+        ...metadata, // Spread all of AI-generated metadata here
+      });
 
-    // 11. Success
-    console.log('[API /process-ppt] Processing finished successfully.');
-    await fs.rm(tempDir, { recursive: true, force: true });
-    console.log(`[API /process-ppt] Cleanup: Removed temp directory ${tempDir}`);
-
-    // Final success response should contain all the relevant data
-    return NextResponse.json({
-      message: 'File processed and all assets stored successfully.',
-      pptId: pptId,
-      r2_original_key: originalFileKey,
-      r2_thumbnail_key: thumbnailKey,
-      r2_preview_keys: previewRecords.map(record => record.preview_url),
-      ...metadata, // Spread all of AI-generated metadata here
-    });
-
-  } catch (error) {
-    console.error('[API /process-ppt] CATCH BLOCK: An error occurred during processing.', error);
-    const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
-    return NextResponse.json({ error: 'Processing failed', details: errorMessage }, { status: 500 });
+    } catch (error) {
+      console.error('[API /process-ppt] CATCH BLOCK: An error occurred during processing.', error);
+      const errorMessage = error instanceof Error ? error.message : 'An unknown error occurred';
+      return NextResponse.json({ error: 'Processing failed', details: errorMessage }, { status: 500 });
+    } finally {
+      // Cleanup temp directory if it exists
+      if (tempDir) {
+        try {
+          await fs.rm(tempDir, { recursive: true, force: true });
+        } catch (cleanupError) {
+          console.error('[API /process-ppt] Failed to cleanup temp directory:', cleanupError);
+        }
+      }
+    }
+  } catch (error: any) {
+    console.error('[API /process-ppt] Outer catch block:', error);
+    return NextResponse.json(
+      { 
+        error: 'Request failed', 
+        message: error.message || 'An unknown error occurred',
+        details: error.toString()
+      }, 
+      { status: 500 }
+    );
   }
 } 
